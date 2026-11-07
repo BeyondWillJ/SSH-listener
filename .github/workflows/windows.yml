@@ -1,0 +1,14 @@
+name: Windows checks
+on:
+  push:
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Parse scripts and verify process-tree lifetime
+        shell: powershell
+        run: ./tests/Test-Listener.ps1

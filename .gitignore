@@ -1,0 +1,12 @@
+# Local installation data and credentials never belong in this repository.
+*.lnk
+*.log
+*.zip
+*.pub
+*.pem
+*.key
+ssh_host_*
+authorized_keys
+settings.json
+test-results/
+.private/
