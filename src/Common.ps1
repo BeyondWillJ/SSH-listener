@@ -55,3 +55,160 @@ LogLevel VERBOSE
 Subsystem sftp "$sftp"
 "@
 }
+
+# ---------------------------------------------------------------------------
+# Modes
+#   Explicit   : the original behaviour. A visible window owns sshd through a
+#                Windows job object; closing the window stops everything.
+#   Background : a dedicated Windows service runs sshd with the same private
+#                configuration. AutoStart selects Automatic or Manual startup.
+# The two modes are mutually exclusive. Switching never touches the system
+# sshd service or its configuration.
+# ---------------------------------------------------------------------------
+$ListenerServiceName = 'SSH-listener'
+$ListenerMutexName = 'Global\SSH-listener'
+$ListenerShortcutNames = @{ Explicit = 'Start SSH.lnk'; Background = 'SSH Listener.lnk' }
+
+function Get-ListenerSshdPath { return (Join-Path $env:WINDIR 'System32\OpenSSH\sshd.exe') }
+
+function Get-ListenerServiceCommand([string]$ConfigPath) {
+    return '"' + (Get-ListenerSshdPath) + '" -f "' + $ConfigPath + '"'
+}
+
+function Get-ListenerService([string]$Name = $ListenerServiceName) {
+    return Get-CimInstance -ClassName Win32_Service -Filter ("Name='" + $Name.Replace("'", "''") + "'")
+}
+
+function Get-ListenerStartupType([bool]$AutoStart) {
+    if ($AutoStart) { return 'Automatic' }
+    return 'Manual'
+}
+
+function Read-ListenerSettings([string]$Root) {
+    $settings = Get-Content -LiteralPath (Join-Path $Root 'settings.json') -Raw | ConvertFrom-Json
+    if ($settings.Product -ne 'SSH-listener' -or $settings.Version -ne 2) {
+        throw 'Installation marker is invalid or from an older version. Back up, uninstall and reinstall.'
+    }
+    return $settings
+}
+
+function Save-ListenerSettings([string]$Root, $Settings) {
+    $data = [ordered]@{
+        Product = 'SSH-listener'; Version = 2; UserName = $Settings.UserName
+        ListenAddress = $Settings.ListenAddress; Port = [int]$Settings.Port
+        AllowedClientAddress = @($Settings.AllowedClientAddress); DesktopPath = $Settings.DesktopPath
+        DesktopShortcut = $Settings.DesktopShortcut; Mode = $Settings.Mode; AutoStart = [bool]$Settings.AutoStart
+    }
+    $data | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $Root 'settings.json') -Encoding utf8
+}
+
+function Enter-ListenerLock {
+    # Held by the explicit-mode window for its whole lifetime, and briefly by
+    # mode changes, so a switch can never race a running explicit listener.
+    $mutex = New-Object Threading.Mutex($false, $ListenerMutexName)
+    $owns = $false
+    try { $owns = $mutex.WaitOne(0) } catch [Threading.AbandonedMutexException] { $owns = $true }
+    if (!$owns) { $mutex.Dispose(); throw 'Close the SSH-listener window (explicit mode) first.' }
+    return $mutex
+}
+
+function Exit-ListenerLock($Mutex) {
+    if ($Mutex) { $Mutex.ReleaseMutex(); $Mutex.Dispose() }
+}
+
+function Test-ListenerShortcutOwned([string]$Path, [string]$Root) {
+    if (!(Test-Path -LiteralPath $Path)) { return $false }
+    $link = (New-Object -ComObject WScript.Shell).CreateShortcut($Path)
+    return ($link.Arguments.IndexOf('"' + $Root.TrimEnd('\') + '\', [StringComparison]::OrdinalIgnoreCase) -ge 0)
+}
+
+function New-ListenerShortcut([string]$Path, [string]$Root, [string]$Script, [string]$Description) {
+    if (Test-Path -LiteralPath $Path) {
+        if (Test-ListenerShortcutOwned $Path $Root) { return }
+        throw "$Path already exists and does not belong to SSH-listener."
+    }
+    $link = (New-Object -ComObject WScript.Shell).CreateShortcut($Path)
+    $link.TargetPath = Join-Path $env:WINDIR 'System32\WindowsPowerShell\v1.0\powershell.exe'
+    $link.Arguments = '-NoProfile -ExecutionPolicy Bypass -File "' + (Join-Path $Root $Script) + '"'
+    $link.WorkingDirectory = $Root
+    $link.IconLocation = (Join-Path $env:WINDIR 'System32\shell32.dll') + ',17'
+    $link.WindowStyle = 1
+    $link.Description = $Description
+    $link.Save()
+}
+
+function Remove-ListenerShortcut([string]$Path, [string]$Root) {
+    if (Test-ListenerShortcutOwned $Path $Root) { Remove-Item -LiteralPath $Path -Force }
+}
+
+function Register-ListenerService([string]$ConfigPath, [bool]$AutoStart, [string]$Name = $ListenerServiceName) {
+    if (Get-Service -Name $Name -ErrorAction SilentlyContinue) { throw "A service named $Name already exists." }
+    $parameters = @{
+        Name = $Name; BinaryPathName = (Get-ListenerServiceCommand $ConfigPath)
+        StartupType = (Get-ListenerStartupType $AutoStart); DisplayName = 'SSH-listener (Tailscale)'
+        Description = 'SSH-listener background mode: private OpenSSH listener on the Tailscale address. Separate from the system sshd service.'
+    }
+    # Start after Tailscale when present. The bind address may still appear a
+    # few seconds later; the restart-on-failure actions below absorb that.
+    if (Get-Service -Name Tailscale -ErrorAction SilentlyContinue) { $parameters.DependsOn = 'Tailscale' }
+    New-Service @parameters | Out-Null
+    try {
+        & sc.exe failure $Name reset= 86400 actions= restart/10000/restart/10000/restart/30000 | Out-Null
+        if ($LASTEXITCODE -ne 0) { throw 'Configuring service recovery failed.' }
+        & sc.exe failureflag $Name 1 | Out-Null
+        if ($LASTEXITCODE -ne 0) { throw 'Configuring service recovery failed.' }
+    } catch { & sc.exe delete $Name | Out-Null; throw }
+}
+
+function Unregister-ListenerService([string]$ConfigPath, [string]$Name = $ListenerServiceName) {
+    $service = Get-ListenerService $Name
+    if (!$service) { return }
+    if ($service.PathName -ne (Get-ListenerServiceCommand $ConfigPath)) {
+        throw "Service $Name does not run this installation's configuration; left unchanged."
+    }
+    if ($service.State -ne 'Stopped') { Stop-Service -Name $Name -Force }
+    & sc.exe delete $Name | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw "Deleting service $Name failed." }
+    $deadline = (Get-Date).AddSeconds(15)
+    while (Get-ListenerService $Name) {
+        if ((Get-Date) -ge $deadline) { throw "Service $Name is marked for deletion. Close the Services console and retry." }
+        Start-Sleep -Milliseconds 250
+    }
+}
+
+function Set-ListenerAutoStart([string]$Root, $Settings, [bool]$AutoStart) {
+    if ($Settings.Mode -ne 'Background') { throw 'Autostart applies only to background mode.' }
+    Set-Service -Name $ListenerServiceName -StartupType (Get-ListenerStartupType $AutoStart)
+    $Settings.AutoStart = $AutoStart
+    Save-ListenerSettings $Root $Settings
+}
+
+function Set-ListenerMode([string]$Root, $Settings, [string]$Mode, [bool]$AutoStart, [bool]$StartNow) {
+    # Idempotent: rerunning after a partial failure converges to the target mode.
+    $config = Join-Path $Root 'sshd_config'
+    $explicitLink = Join-Path $Settings.DesktopPath $ListenerShortcutNames.Explicit
+    $backgroundLink = Join-Path $Settings.DesktopPath $ListenerShortcutNames.Background
+    if ($Mode -eq 'Background') {
+        $service = Get-ListenerService
+        if ($service) {
+            if ($service.PathName -ne (Get-ListenerServiceCommand $config)) {
+                throw "Service $ListenerServiceName does not run this installation's configuration."
+            }
+            Set-Service -Name $ListenerServiceName -StartupType (Get-ListenerStartupType $AutoStart)
+        } else { Register-ListenerService $config $AutoStart }
+        Remove-ListenerShortcut $explicitLink $Root
+        New-ListenerShortcut $backgroundLink $Root 'Manage-SSHListener.ps1' 'SSH-listener background service: status, start, stop, autostart.'
+        $Settings.DesktopShortcut = $backgroundLink
+        $Settings.Mode = 'Background'; $Settings.AutoStart = $AutoStart
+        Save-ListenerSettings $Root $Settings
+        if ($StartNow -and (Get-Service -Name $ListenerServiceName).Status -ne 'Running') { Start-Service -Name $ListenerServiceName }
+    } elseif ($Mode -eq 'Explicit') {
+        if ($AutoStart) { throw 'Autostart applies only to background mode.' }
+        Unregister-ListenerService $config
+        Remove-ListenerShortcut $backgroundLink $Root
+        New-ListenerShortcut $explicitLink $Root 'Start-SSHListener.ps1' 'Open SSH over Tailscale; close the window to stop.'
+        $Settings.DesktopShortcut = $explicitLink
+        $Settings.Mode = 'Explicit'; $Settings.AutoStart = $false
+        Save-ListenerSettings $Root $Settings
+    } else { throw "Unknown mode: $Mode" }
+}

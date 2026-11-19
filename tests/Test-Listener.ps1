@@ -23,6 +23,14 @@ $config = New-ListenerConfig 'C:\ProgramData\SSH-listener' 'ExampleUser' '100.64
 Assert-True ($config.Contains('AllowUsers exampleuser@100.64.0.20 exampleuser@100.64.0.21')) 'Bind user authentication to the permitted client IPs'
 Assert-True ($config.Contains('PasswordAuthentication no')) 'Password authentication disabled'
 Assert-True ($config.Contains('AllowTcpForwarding no')) 'TCP forwarding disabled'
+$serviceCommand = Get-ListenerServiceCommand 'C:\ProgramData\SSH-listener\sshd_config'
+Assert-True ($serviceCommand -eq ('"' + (Join-Path $env:WINDIR 'System32\OpenSSH\sshd.exe') + '" -f "C:\ProgramData\SSH-listener\sshd_config"')) 'Background service runs sshd with the private configuration, quoted'
+Assert-True ($serviceCommand -notmatch ' -D| -d| -e') 'Background service command has no foreground/debug flags'
+Assert-True ((Get-ListenerStartupType $true) -eq 'Automatic' -and (Get-ListenerStartupType $false) -eq 'Manual') 'Autostart maps to Automatic, otherwise Manual'
+Assert-True ($ListenerShortcutNames.Explicit -ne $ListenerShortcutNames.Background) 'Each mode has its own desktop shortcut'
+foreach ($name in @('Start-SSHListener.ps1','Manage-SSHListener.ps1','Set-SSHListenerMode.ps1','Common.ps1','SshWindowLifetime.cs')) {
+    Assert-True (Test-Path -LiteralPath (Join-Path $root "src\$name")) "Installer payload present: $name"
+}
 Add-Type -Path (Join-Path $root 'src\SshWindowLifetime.cs')
 $powershell = Join-Path $env:WINDIR 'System32\WindowsPowerShell\v1.0\powershell.exe'
 $testRoot = Join-Path ([IO.Path]::GetTempPath()) ('ssh-listener-test-' + [Guid]::NewGuid().ToString('N'))

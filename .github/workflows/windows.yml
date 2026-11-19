@@ -12,3 +12,23 @@ jobs:
       - name: Parse scripts and verify process-tree lifetime
         shell: powershell
         run: ./tests/Test-Listener.ps1
+  integration:
+    # Disposable runner: installs OpenSSH Server, then exercises real logins,
+    # the background service and mode switching on loopback only.
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Windows OpenSSH Server
+        shell: powershell
+        run: |
+          if (!(Test-Path "$env:WINDIR\System32\OpenSSH\sshd.exe")) {
+            $cap = Add-WindowsCapability -Online -Name 'OpenSSH.Server~~~~0.0.1.0'
+            if ($cap.RestartNeeded) { throw 'OpenSSH Server needs a restart.' }
+          }
+          & "$env:WINDIR\System32\OpenSSH\sshd.exe" -V
+      - name: Public-key login and job shutdown (explicit runtime)
+        shell: powershell
+        run: ./tests/Test-OpenSsh.ps1
+      - name: Explicit and background modes end to end
+        shell: powershell
+        run: ./tests/Test-Modes.ps1 -AllowSystemChanges
