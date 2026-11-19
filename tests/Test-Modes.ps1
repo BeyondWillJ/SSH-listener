@@ -137,7 +137,8 @@ try {
     # --- Background with autostart, then uninstall ---
     Assert-True ((Invoke-Installed 'Set-SSHListenerMode.ps1' @('-Mode','Background','-AutoStart')) -eq 0 -and (Get-Service $ListenerServiceName).StartType -eq 'Automatic') 'Background mode with autostart'
     Assert-True ((Wait-Until { Test-Listening }) -and (Test-Login)) 'Login after switching back to background'
-    & $powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'Uninstall.ps1') -Confirm:$false | Out-Host
+    # -File would pass '$false' as a string; -Command keeps it a real switch value.
+    & $powershell -NoProfile -ExecutionPolicy Bypass -Command ("& '" + (Join-Path $root 'Uninstall.ps1') + "' -Confirm:`$false; exit `$LASTEXITCODE") | Out-Host
     Assert-True ($LASTEXITCODE -eq 0) 'Uninstall succeeds'
     Assert-True (!(Get-ListenerService) -and !(Test-Path -LiteralPath $root)) 'Uninstall removes service and application directory'
     Assert-True (!(Test-Path -LiteralPath (Join-Path $desktop $ListenerShortcutNames.Background)) -and !(Test-Path -LiteralPath (Join-Path $desktop $ListenerShortcutNames.Explicit))) 'Uninstall removes shortcuts'
